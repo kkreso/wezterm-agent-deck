@@ -10,14 +10,11 @@ local default_patterns = {
     working = {
         'esc to interrupt',
         'esc interrupt',
-        'thinking',
-        'pondering',
-        'processing',
-        'analyzing',
-        'generating',
-        'writing',
-        'reading',
-        'searching',
+        'thinking%.%.%.',
+        'pondering%.%.%.',
+        'generating%.%.%.',
+        'ctrl%+c to interrupt',
+        'building tool call',
         'delegating work',
         'planning next steps',
         'gathering context',
@@ -61,6 +58,9 @@ local default_patterns = {
         'enter confirm',
         'esc dismiss',
         'type your own answer',
+        'allow once',
+        'allow always',
+        'deny',
     },
     
     -- Idle patterns - agent is ready for input
@@ -68,6 +68,9 @@ local default_patterns = {
         '^>%s*$',       -- Empty > prompt
         '^> $',         -- > prompt with space
         '^>$',          -- Just > at end of line
+        '^❯%s*$',       -- Unicode prompt (U+276F)
+        '^❯ $',         -- Unicode prompt with space
+        '^❯$',          -- Just ❯ at end of line
     },
 }
 
@@ -92,8 +95,7 @@ local function strip_ansi(text)
     result = result:gsub('\27%[%?%d+[hl]', '')  -- Mode setting sequences
     result = result:gsub('\27%[%d*[ABCDEFGJKST]', '')  -- Cursor movement
     result = result:gsub('\27%[%d*;%d*[Hf]', '')  -- Cursor positioning
-    result = result:gsub('\27%[%d*m', '')  -- SGR sequences
-    result = result:gsub('\27%[[0-9;]*m', '')  -- Extended SGR
+    result = result:gsub('\27%[[0-9;]*m', '')  -- SGR sequences
     result = result:gsub('\r', '')  -- Carriage return
     
     return result
@@ -206,7 +208,7 @@ function M.detect_status(pane, agent_type, config)
     -- Get patterns for this agent
     local patterns = get_patterns_for_agent(agent_type, config)
 
-    -- Check in priority order: idle > waiting > working
+    -- Check in priority order: idle > working > waiting
     -- Idle check first - if prompt is ready, agent is idle regardless of scrollback
     -- This prevents false "working" status when agent just started or finished
     local last_lines = get_last_lines(clean_text, 5)
@@ -216,7 +218,7 @@ function M.detect_status(pane, agent_type, config)
 
         -- Check for ">" prompt (Claude/OpenCode prompt starts with >)
         -- Matches: ">", "> ", "> Try something...", etc.
-        if trimmed == '>' or trimmed:match('^>%s') then
+        if trimmed == '>' or trimmed == '❯' or trimmed:match('^>%s') or trimmed:match('^❯%s') then
             return 'idle'
         end
 
@@ -226,16 +228,16 @@ function M.detect_status(pane, agent_type, config)
         end
     end
 
-    -- Then check waiting (needs user attention) - use recent 30 lines
-    local recent_text = get_last_lines(clean_text, 30)
-    if matches_any(recent_text, patterns.waiting) then
-        return 'waiting'
-    end
-
-    -- Finally check working (only in last 10 lines to avoid stale matches)
+    -- Then check working (only in last 10 lines to avoid stale matches)
     local very_recent = get_last_lines(clean_text, 10)
     if matches_any(very_recent, patterns.working) then
         return 'working'
+    end
+
+    -- Finally check waiting (needs user attention) - use recent 30 lines
+    local recent_text = get_last_lines(clean_text, 30)
+    if matches_any(recent_text, patterns.waiting) then
+        return 'waiting'
     end
 
     -- Default to idle

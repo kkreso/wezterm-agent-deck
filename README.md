@@ -139,6 +139,103 @@ agents = {
 }
 ```
 
+## Hook-Based State Detection (Claude Code)
+
+The default text-scraping approach can produce false positives when conversation content matches status patterns. For Claude Code, you can use **hooks** for reliable state detection with zero false positives.
+
+### Setup
+
+1. Create the hook script at `~/.claude/hooks/agent-deck-state.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+STATE_DIR="/tmp/wezterm-agent-deck"
+mkdir -p "$STATE_DIR"
+
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+
+[ -z "$SESSION_ID" ] && exit 0
+
+STATE_FILE="$STATE_DIR/$SESSION_ID"
+
+case "$EVENT" in
+    UserPromptSubmit)
+        echo "working" > "$STATE_FILE.state"
+        ;;
+    SessionStart)
+        echo "idle" > "$STATE_FILE.state"
+        echo "$CWD" > "$STATE_FILE.cwd"
+        CLAUDE_PID=$(ps -o ppid= -p $PPID 2>/dev/null | tr -d ' ')
+        [ -n "$CLAUDE_PID" ] && echo "$CLAUDE_PID" > "$STATE_FILE.pid"
+        ;;
+    PreToolUse)
+        echo "working" > "$STATE_FILE.state"
+        ;;
+    Stop)
+        LAST_LINE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty' | tail -1)
+        if echo "$LAST_LINE" | grep -qE '\?[[:space:]]*$'; then
+            echo "waiting" > "$STATE_FILE.state"
+        else
+            echo "idle" > "$STATE_FILE.state"
+        fi
+        ;;
+    Notification)
+        NTYPE=$(echo "$INPUT" | jq -r '.notification_type // empty')
+        case "$NTYPE" in
+            permission_prompt|elicitation_dialog)
+                echo "waiting" > "$STATE_FILE.state"
+                ;;
+        esac
+        ;;
+    SessionEnd)
+        rm -f "$STATE_FILE.state" "$STATE_FILE.cwd" "$STATE_FILE.pid"
+        ;;
+esac
+```
+
+2. Make it executable: `chmod +x ~/.claude/hooks/agent-deck-state.sh`
+
+3. Add hooks to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.claude/hooks/agent-deck-state.sh" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.claude/hooks/agent-deck-state.sh" }] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.claude/hooks/agent-deck-state.sh" }] }
+    ],
+    "Notification": [
+      { "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "~/.claude/hooks/agent-deck-state.sh" }] },
+      { "matcher": "elicitation_dialog", "hooks": [{ "type": "command", "command": "~/.claude/hooks/agent-deck-state.sh" }] }
+    ],
+    "SessionStart": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.claude/hooks/agent-deck-state.sh" }] }
+    ],
+    "SessionEnd": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.claude/hooks/agent-deck-state.sh" }] }
+    ]
+  }
+}
+```
+
+### How It Works
+
+- Hooks write state files to `/tmp/wezterm-agent-deck/<session_id>.{state,cwd,pid}`
+- The plugin matches pane to state file by PID (process tree) then CWD
+- `UserPromptSubmit` → working, `PreToolUse` → working, `Stop` → idle (or waiting if last line ends with `?`), `Notification(permission_prompt)` → waiting
+- Stale state files are auto-cleaned when the Claude Code process dies
+- Falls back to text-based detection for agents without hooks (OpenCode, Aider, etc.)
+
 ## Development
 
 ```lua

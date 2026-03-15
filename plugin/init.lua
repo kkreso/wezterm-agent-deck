@@ -45,22 +45,6 @@ end
 -- Initialize package path
 local plugin_dir = setup_package_path()
 
--- Lazy-loaded modules (loaded on first use)
-local modules = {}
-
-local function get_module(name)
-    if not modules[name] then
-        local success, mod = pcall(require, name)
-        if success then
-            modules[name] = mod
-        else
-            wezterm.log_error('[agent-deck] Failed to load module ' .. name .. ': ' .. tostring(mod))
-            return nil
-        end
-    end
-    return modules[name]
-end
-
 -- Internal state
 local state = {
     initialized = false,
@@ -185,11 +169,25 @@ local default_config = {
 
 local current_config = nil
 
+local function is_array(t)
+    if type(t) ~= 'table' then return false end
+    local i = 0
+    for _ in pairs(t) do
+        i = i + 1
+        if t[i] == nil then return false end
+    end
+    return i > 0
+end
+
 local function deep_merge(t1, t2)
     local result = {}
     for k, v in pairs(t1) do
         if type(v) == 'table' and type(t2[k]) == 'table' then
-            result[k] = deep_merge(v, t2[k])
+            if is_array(v) or is_array(t2[k]) then
+                result[k] = t2[k]  -- arrays: replace wholesale
+            else
+                result[k] = deep_merge(v, t2[k])
+            end
         elseif t2[k] ~= nil then
             result[k] = t2[k]
         else
@@ -245,7 +243,23 @@ end
      ============================================ ]]
 
 local detection_cache = {}
-local CACHE_TTL_MS = 5000
+local CACHE_TTL_S = 5
+
+local last_cache_prune = 0
+local CACHE_PRUNE_INTERVAL_S = 60
+
+local function prune_detection_cache()
+    local now = os.time()
+    if (now - last_cache_prune) < CACHE_PRUNE_INTERVAL_S then
+        return
+    end
+    last_cache_prune = now
+    for pane_id, entry in pairs(detection_cache) do
+        if (now - entry.timestamp) >= CACHE_TTL_S then
+            detection_cache[pane_id] = nil
+        end
+    end
+end
 
 local function get_executable_name(path)
     if not path then return '' end
@@ -317,10 +331,10 @@ end
 
 local function detect_agent(pane, config)
     local pane_id = pane:pane_id()
-    local now = os.time() * 1000
-    
+    local now = os.time()
+
     local cached = detection_cache[pane_id]
-    if cached and (now - cached.timestamp) < CACHE_TTL_MS then
+    if cached and (now - cached.timestamp) < CACHE_TTL_S then
         return cached.agent_type
     end
     
@@ -387,32 +401,42 @@ end
      Status Detection (inline)
      ============================================ ]]
 
+-- Check if a string starts with a braille pattern character (U+2800-U+28FF).
+-- Claude Code uses braille spinners in the pane title while working.
+-- In UTF-8, braille block is: E2 A0 80 through E2 A3 BF.
+-- Note: ✳ (U+2733, idle icon) is NOT braille and won't match.
+local function starts_with_braille(s)
+    if not s or #s < 3 then return false end
+    local b1, b2, b3 = s:byte(1), s:byte(2), s:byte(3)
+    return b1 == 0xE2 and b2 >= 0xA0 and b2 <= 0xA3 and b3 >= 0x80 and b3 <= 0xBF
+end
+
 local default_patterns = {
+    -- Working: authoritative text indicators (checked after spinner chars)
     working = {
         'esc to interrupt',
         'esc interrupt',
         'ctrl%+c to interrupt',
-        'thinking', 'pondering', 'processing', 'analyzing',
-        'generating', 'writing', 'reading', 'searching',
-        'delegating work', 'planning next steps', 'gathering context',
-        'searching the codebase', 'searching the web', 'making edits',
-        'running commands', 'gathering thoughts', 'considering next steps',
     },
+    -- Waiting: permission prompts and interactive questions
     waiting = {
-        'esc to cancel', 'yes, allow once', 'yes, allow always',
-        'allow once', 'allow always', 'deny',
-        'no, and tell', 'do you trust', 'run this command',
-        'execute this', 'continue%?', 'proceed%?',
+        -- Permission dialogs
+        'yes, allow once', 'yes, allow always',
+        'allow once', 'allow always',
+        'no, and tell claude what to do differently',
+        'do you trust the files',
+        -- Selection indicators
+        '❯ yes', '❯ no', '❯ allow',
+        -- Generic prompts
+        'run this command%?', 'execute this%?',
+        'continue%?', 'proceed%?',
+        'approve this plan', 'do you want to proceed',
         '%(y/n%)', '%(Y/n%)', '%[y/n%]', '%[Y/n%]',
         '%(y/N%)', '%(Y/N%)', '%[y/N%]', '%[Y/N%]',
-        'approve this plan', 'do you want to proceed',
-        'press enter to continue',
-        -- Plan mode ask tool patterns (OpenCode v1.1.18+)
-        'enter confirm',           -- Confirmation hint in ask dialog footer
-        'esc dismiss',             -- Dismiss hint in ask dialog footer
-        'type your own answer',    -- Custom input option in ask dialogs
+        -- OpenCode plan mode
+        'enter confirm', 'esc dismiss', 'type your own answer',
     },
-    idle = { '^>%s*$', '^> $', '^>$' },
+    idle = { '^>%s*$', '^> $', '^>$', '^❯%s*$', '^❯ $', '^❯$' },
 }
 
 local function strip_ansi(text)
@@ -424,7 +448,6 @@ local function strip_ansi(text)
     result = result:gsub('\27%[%?%d+[hl]', '')
     result = result:gsub('\27%[%d*[ABCDEFGJKST]', '')
     result = result:gsub('\27%[%d*;%d*[Hf]', '')
-    result = result:gsub('\27%[%d*m', '')
     result = result:gsub('\27%[[0-9;]*m', '')
     result = result:gsub('\r', '')
     return result
@@ -457,9 +480,140 @@ local function get_last_lines(text, n)
     return table.concat(result, '\n')
 end
 
+-- ================================================================
+-- Hook-based state detection via /tmp/wezterm-agent-deck/
+-- Claude Code hooks write state files with session_id as key.
+-- We match pane to state file by comparing CWDs.
+-- ================================================================
+local STATE_DIR = '/tmp/wezterm-agent-deck'
+local state_file_cache = {}
+local last_state_scan = 0
+local STATE_SCAN_INTERVAL_S = 2
+
+-- Normalize path: resolve /private/tmp <-> /tmp symlink on macOS
+local function normalize_path(path)
+    if not path then return nil end
+    path = path:gsub('^/private/tmp', '/tmp')
+    path = path:gsub('^/private/var', '/var')
+    return path
+end
+
+-- Scan state files and build pid->state and cwd->state maps
+local function scan_state_files()
+    local now = os.time()
+    if (now - last_state_scan) < STATE_SCAN_INTERVAL_S then
+        return state_file_cache
+    end
+    last_state_scan = now
+
+    local result = { by_pid = {}, by_cwd = {} }
+    local priority = { waiting = 3, working = 2, idle = 1 }
+    local dir_handle = io.popen('ls "' .. STATE_DIR .. '/"*.state 2>/dev/null')
+    if dir_handle then
+        for path in dir_handle:lines() do
+            local session_id = path:match('/([^/]+)%.state$')
+            if session_id then
+                local sf = io.open(path)
+                if sf then
+                    local s = sf:read('*l')
+                    sf:close()
+                    if s then
+                        -- Read PID and check if process is still alive
+                        local pf = io.open(STATE_DIR .. '/' .. session_id .. '.pid')
+                        if pf then
+                            local pid = pf:read('*l')
+                            pf:close()
+                            if pid then
+                                -- Check if process is alive (signal 0 = existence check)
+                                local alive = os.execute('kill -0 ' .. pid .. ' 2>/dev/null')
+                                if alive then
+                                    result.by_pid[pid] = s
+                                else
+                                    -- Process dead, clean up stale state files
+                                    os.remove(path)
+                                    os.remove(STATE_DIR .. '/' .. session_id .. '.cwd')
+                                    os.remove(STATE_DIR .. '/' .. session_id .. '.pid')
+                                    s = nil  -- skip CWD mapping
+                                end
+                            end
+                        end
+                        -- Read CWD
+                        local cf = io.open(STATE_DIR .. '/' .. session_id .. '.cwd')
+                        if cf then
+                            local cwd = normalize_path(cf:read('*l'))
+                            cf:close()
+                            if cwd then
+                                local existing = result.by_cwd[cwd]
+                                if not existing or (priority[s] or 0) > (priority[existing] or 0) then
+                                    result.by_cwd[cwd] = s
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        dir_handle:close()
+    end
+
+    state_file_cache = result
+    return result
+end
+
+-- Get pane's CWD
+local function get_pane_cwd(pane)
+    local ok, info = pcall(function()
+        return pane:get_current_working_dir()
+    end)
+    if ok and info then
+        local path = type(info) == 'string' and info or (info.file_path or tostring(info))
+        path = path:gsub('^file://', ''):gsub('/$', '')
+        path = path:gsub('%%(%x%x)', function(h) return string.char(tonumber(h, 16)) end)
+        return normalize_path(path)
+    end
+    return nil
+end
+
+-- Collect PIDs from pane's process tree
+local function get_pane_pids(pane)
+    local pids = {}
+    local ok, info = pcall(function() return pane:get_foreground_process_info() end)
+    if ok and info then
+        if info.pid then pids[tostring(info.pid)] = true end
+        if info.ppid then pids[tostring(info.ppid)] = true end
+        if info.children then
+            for _, child in pairs(info.children) do
+                if child.pid then pids[tostring(child.pid)] = true end
+            end
+        end
+    end
+    -- Also try simpler API
+    local ok2, pid = pcall(function() return pane:get_foreground_process_info().pid end)
+    if ok2 and pid then pids[tostring(pid)] = true end
+    return pids
+end
+
 local function detect_status(pane, agent_type, config)
     if not agent_type then return 'inactive' end
 
+    -- Try hook-based state files (authoritative, no false positives)
+    local states = scan_state_files()
+
+    -- Match by PID first (most reliable)
+    local pids = get_pane_pids(pane)
+    for pid in pairs(pids) do
+        local s = states.by_pid[pid]
+        if s then return s end
+    end
+
+    -- Match by CWD (fallback)
+    local cwd = get_pane_cwd(pane)
+    if cwd then
+        local s = states.by_cwd[cwd]
+        if s then return s end
+    end
+
+    -- Fallback: text-based detection for agents without hooks
     local success, text = pcall(function()
         return pane:get_lines_as_text(config.max_lines or 100)
     end)
@@ -480,52 +634,27 @@ local function detect_status(pane, agent_type, config)
         }
     end
 
-    -- Check in priority order: idle > working > waiting
-    local last_lines = get_last_lines(clean_text, 5)
-    local last_line_empty = false
-
-    for line in last_lines:gmatch('[^\n]+') do
-        local trimmed = line:match('^%s*(.-)%s*$') or ''
-
-        -- Check for ">" prompt (Claude/OpenCode prompt starts with >)
-        if trimmed == '>' or trimmed:match('^>%s') then
-            return 'idle'
-        end
-
-        -- Check custom idle patterns
-        if matches_any_status(trimmed, patterns.idle) then
-            return 'idle'
-        end
-    end
-
-    -- Check if last line is empty/whitespace (OpenCode idle state)
-    local lines = {}
+    local all_lines = {}
     for line in clean_text:gmatch('[^\n]+') do
-        table.insert(lines, line)
-    end
-    if #lines > 0 then
-        local last = lines[#lines]:match('^%s*(.-)%s*$') or ''
-        last_line_empty = (last == '')
+        table.insert(all_lines, line)
     end
 
-    -- Check working before waiting
-    local very_recent = get_last_lines(clean_text, 10)
-    if matches_any_status(very_recent, patterns.working) then
+    local function tail_lines(n)
+        local start = math.max(1, #all_lines - n + 1)
+        local r = {}
+        for i = start, #all_lines do
+            table.insert(r, all_lines[i])
+        end
+        return r
+    end
+
+    local last_10 = tail_lines(10)
+    local last_10_text = table.concat(last_10, '\n')
+
+    if matches_any_status(last_10_text, patterns.working) then
         return 'working'
     end
 
-    -- If last line is empty and no working indicators, likely idle
-    if last_line_empty then
-        return 'idle'
-    end
-
-    -- Check waiting only in very recent lines (reduce false positives from scrollback)
-    local recent_text = get_last_lines(clean_text, 10)
-    if matches_any_status(recent_text, patterns.waiting) then
-        return 'waiting'
-    end
-
-    -- Default to idle
     return 'idle'
 end
 
@@ -739,7 +868,7 @@ end
      Notifications (inline)
      ============================================ ]]
 
-local MIN_NOTIFICATION_GAP_MS = 10000
+local MIN_NOTIFICATION_GAP_S = 10
 
 local function shell_escape(str)
     if not str then return '' end
@@ -768,17 +897,8 @@ local function send_terminal_notifier(subtitle, message, config)
         cmd = cmd .. ' -sender com.github.wez.wezterm'
     end
     
-    local handle = io.popen(cmd .. ' 2>&1', 'r')
-    if handle then
-        local result = handle:read('*a')
-        local success, _, code = handle:close()
-        if not success or code ~= 0 then
-            wezterm.log_warn('[agent-deck] terminal-notifier failed: ' .. (result or 'unknown error'))
-            return false
-        end
-        return true
-    end
-    return false
+    os.execute(cmd .. ' >/dev/null 2>&1 &')
+    return true
 end
 
 local function notify_waiting(pane, agent_type, config)
@@ -839,8 +959,8 @@ end
 local function update_agent_state(pane, config)
     local pane_id = pane:pane_id()
     local current_state = state.agent_states[pane_id]
-    local now = os.time() * 1000
-    
+    local now = os.time()
+
     local agent_type = detect_agent(pane, config)
     
     if not agent_type then
@@ -883,7 +1003,7 @@ local function update_agent_state(pane, config)
             current_state.cooldown_start = now
             current_state.last_update = now
             return current_state
-        elseif (now - current_state.cooldown_start) < config.cooldown_ms then
+        elseif (now - current_state.cooldown_start) < math.ceil(config.cooldown_ms / 1000) then
             current_state.last_update = now
             return current_state
         end
@@ -899,7 +1019,7 @@ local function update_agent_state(pane, config)
         
         if new_status == 'waiting' then
             local last_notify = state.last_notification[pane_id] or 0
-            if (now - last_notify) > MIN_NOTIFICATION_GAP_MS then
+            if (now - last_notify) > MIN_NOTIFICATION_GAP_S then
                 notify_waiting(pane, agent_type, config)
                 state.last_notification[pane_id] = now
                 wezterm.emit('agent_deck.attention_needed', nil, pane, agent_type, 'waiting_for_input')
@@ -968,24 +1088,46 @@ function M.apply_to_config(config, opts)
     -- Status bar (right status)
     if plugin_config.right_status.enabled then
         wezterm.on('update-status', function(window, pane)
+            prune_detection_cache()
+            local active_panes = {}
             for _, mux_tab in ipairs(window:mux_window():tabs()) do
                 for _, p in ipairs(mux_tab:panes()) do
+                    active_panes[p:pane_id()] = true
                     update_agent_state(p, plugin_config)
                 end
             end
-            
+            -- Prune stale state for closed panes
+            for pane_id in pairs(state.agent_states) do
+                if not active_panes[pane_id] then
+                    state.agent_states[pane_id] = nil
+                    state.last_notification[pane_id] = nil
+                    detection_cache[pane_id] = nil
+                end
+            end
+
             local counts = count_agents_by_status()
             local right_status = render_right_status(counts)
-            
+
             if right_status and #right_status > 0 then
                 window:set_right_status(wezterm.format(right_status))
             end
         end)
     else
         wezterm.on('update-status', function(window, pane)
+            prune_detection_cache()
+            local active_panes = {}
             for _, mux_tab in ipairs(window:mux_window():tabs()) do
                 for _, p in ipairs(mux_tab:panes()) do
+                    active_panes[p:pane_id()] = true
                     update_agent_state(p, plugin_config)
+                end
+            end
+            -- Prune stale state for closed panes
+            for pane_id in pairs(state.agent_states) do
+                if not active_panes[pane_id] then
+                    state.agent_states[pane_id] = nil
+                    state.last_notification[pane_id] = nil
+                    detection_cache[pane_id] = nil
                 end
             end
         end)

@@ -6,7 +6,7 @@ local M = {}
 
 -- Rate limiting state
 local last_notification = {}  -- pane_id -> timestamp
-local MIN_NOTIFICATION_GAP_MS = 10000  -- Minimum 10 seconds between notifications per pane
+local MIN_NOTIFICATION_GAP_S = 10  -- Minimum 10 seconds between notifications per pane
 
 -- Notification queue for batch processing
 local notification_queue = {}
@@ -16,10 +16,10 @@ local MAX_QUEUE_SIZE = 10
 ---@param pane_id number Pane ID
 ---@return boolean True if notification is allowed
 local function can_notify(pane_id)
-    local now = os.time() * 1000
+    local now = os.time()
     local last = last_notification[pane_id] or 0
     
-    return (now - last) >= MIN_NOTIFICATION_GAP_MS
+    return (now - last) >= MIN_NOTIFICATION_GAP_S
 end
 
 --- Record that a notification was sent
@@ -88,12 +88,12 @@ function M.process_queue(window)
         return
     end
     
-    local now = os.time() * 1000
+    local now = os.time()
     local processed = {}
     
     for i, notification in ipairs(notification_queue) do
         -- Skip old notifications (older than 30 seconds)
-        if (now - notification.timestamp) < 30000 then
+        if (now - notification.timestamp) < 30 then
             send_toast(window, notification.title, notification.message, notification.timeout_ms)
         end
         table.insert(processed, i)

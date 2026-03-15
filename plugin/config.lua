@@ -143,6 +143,19 @@ local default_config = {
 -- Current configuration (merged with user options)
 local current_config = nil
 
+--- Check if a table is an array (sequential integer keys starting at 1)
+---@param t any Value to check
+---@return boolean True if t is an array-like table
+local function is_array(t)
+    if type(t) ~= 'table' then return false end
+    local i = 0
+    for _ in pairs(t) do
+        i = i + 1
+        if t[i] == nil then return false end
+    end
+    return i > 0
+end
+
 --- Deep merge two tables
 ---@param t1 table Base table
 ---@param t2 table Table to merge into base
@@ -153,7 +166,11 @@ local function deep_merge(t1, t2)
     -- Copy all from t1
     for k, v in pairs(t1) do
         if type(v) == 'table' and type(t2[k]) == 'table' then
-            result[k] = deep_merge(v, t2[k])
+            if is_array(v) or is_array(t2[k]) then
+                result[k] = t2[k]
+            else
+                result[k] = deep_merge(v, t2[k])
+            end
         elseif t2[k] ~= nil then
             result[k] = t2[k]
         else

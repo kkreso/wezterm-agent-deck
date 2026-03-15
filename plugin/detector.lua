@@ -7,7 +7,9 @@ local M = {}
 -- Cache for agent detection results
 -- Structure: { pane_id -> { agent_type, timestamp } }
 local detection_cache = {}
-local CACHE_TTL_MS = 5000  -- Cache results for 5 seconds
+local CACHE_TTL_S = 5  -- Cache results for 5 seconds
+local last_cache_prune = 0
+local CACHE_PRUNE_INTERVAL_S = 60
 
 --- Check if a string matches any pattern in a list
 ---@param str string String to check
@@ -62,8 +64,8 @@ local function is_cache_valid(entry)
         return false
     end
     
-    local now = os.time() * 1000
-    return (now - entry.timestamp) < CACHE_TTL_MS
+    local now = os.time()
+    return (now - entry.timestamp) < CACHE_TTL_S
 end
 
 --- Check if an agent is enabled in the configuration
@@ -245,7 +247,7 @@ function M.detect_agent(pane, config)
     -- Update cache
     detection_cache[pane_id] = {
         agent_type = agent_type,
-        timestamp = os.time() * 1000,
+        timestamp = os.time(),
     }
     
     return agent_type
@@ -265,15 +267,30 @@ end
 ---@return table<number, string> Map of pane_id -> agent_type
 function M.get_cached_agents()
     local result = {}
-    local now = os.time() * 1000
-    
+    local now = os.time()
+
     for pane_id, entry in pairs(detection_cache) do
-        if (now - entry.timestamp) < CACHE_TTL_MS and entry.agent_type then
+        if (now - entry.timestamp) < CACHE_TTL_S and entry.agent_type then
             result[pane_id] = entry.agent_type
         end
     end
     
     return result
+end
+
+--- Prune expired entries from the detection cache
+function M.prune_cache()
+    local now = os.time()
+    if (now - last_cache_prune) < CACHE_PRUNE_INTERVAL_S then
+        return
+    end
+    last_cache_prune = now
+
+    for pane_id, entry in pairs(detection_cache) do
+        if (now - entry.timestamp) >= CACHE_TTL_S then
+            detection_cache[pane_id] = nil
+        end
+    end
 end
 
 return M
